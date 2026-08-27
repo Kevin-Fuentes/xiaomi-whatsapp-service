@@ -210,14 +210,28 @@ async function startWA(force=false){
    startedAt:new Date().toISOString()
   };
 
-  context=await chromium.launchPersistentContext(PROFILE_DIR,{
-   headless:true,
-   viewport:{width:1365,height:900},
-   locale:"es-CO",
-   timezoneId:"America/Bogota",
-   args:["--no-sandbox","--disable-dev-shm-usage","--disable-gpu","--no-first-run","--no-default-browser-check"]
-  });
+context = await chromium.launchPersistentContext(PROFILE_DIR, {
+  headless: true,
+  viewport: {
+    width: 1365,
+    height: 900
+  },
+  locale: "es-CO",
+  timezoneId: "America/Bogota",
 
+  userAgent:
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+    "AppleWebKit/537.36 (KHTML, like Gecko) " +
+    "Chrome/131.0.0.0 Safari/537.36",
+
+  args: [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--no-first-run",
+    "--no-default-browser-check"
+  ]
+});
   page=context.pages()[0]||await context.newPage();
   page.on("close",()=>logger.warn("WhatsApp page closed"));
   context.on("close",()=>{
