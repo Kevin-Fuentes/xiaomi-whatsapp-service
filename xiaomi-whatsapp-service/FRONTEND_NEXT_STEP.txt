@@ -1,0 +1,12 @@
+Cuando tengas el nuevo dominio de Railway, no cambies el resto de APIs.
+Solo WhatsApp debe apuntar al nuevo servicio.
+
+Ejemplo:
+WA_API=https://NUEVO-SERVICIO.up.railway.app/api
+WA_SOCKET=https://NUEVO-SERVICIO.up.railway.app
+
+Después modificaremos el bundle original para:
+1) status/connect/disconnect/templates -> nuevo servicio
+2) Socket.IO -> nuevo servicio
+3) al crear una orden -> POST /api/whatsapp/order
+4) recordatorios -> POST /api/whatsapp/reminder
