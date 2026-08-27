@@ -230,7 +230,6 @@ app.post("/api/whatsapp/reset-session", async (req, res) => {
   try {
     const authPath = path.join(DATA_DIR, "auth");
 
-    // Cerrar la conexión actual antes de borrar credenciales
     try {
       if (sock) {
         sock.end(undefined);
@@ -240,23 +239,21 @@ app.post("/api/whatsapp/reset-session", async (req, res) => {
       console.warn("Error cerrando socket:", e.message);
     }
 
-    // Borrar SOLO la sesión de WhatsApp
     await fs.rm(authPath, {
       recursive: true,
       force: true
     });
 
-    // Reiniciar estado
     status = "disconnected";
-    qrData = null;
+    latestQr = null;
 
     console.log("WhatsApp auth session deleted:", authPath);
 
     res.json({
       success: true,
-      message: "Sesión de WhatsApp eliminada",
-      path: authPath
+      message: "Sesión de WhatsApp eliminada"
     });
+
   } catch (error) {
     console.error("Error resetting WhatsApp session:", error);
 
