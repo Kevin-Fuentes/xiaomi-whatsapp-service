@@ -209,13 +209,78 @@ async function refreshState() {
   if (!page || page.isClosed()) return;
 
   try {
-    // 1. Detectar claramente la interfaz conectada
-    if (await isConnectedUi()) {
-      if (status !== "connected") {
+    const bodyText = await page.locator("body")
+      .innerText()
+      .catch(() => "");
+
+    // 1. Detectar que WhatsApp volvió a pedir inicio de sesión.
+    // Esto ocurre también cuando desvinculas el dispositivo desde el celular.
+    const loginScreen =
+      bodyText.includes("Escanea para iniciar sesión") ||
+      bodyText.includes("Escanea el código QR") ||
+      bodyText.includes("Vincular con el número de teléfono") ||
+      bodyText.includes("Iniciar sesión con número de teléfono") ||
+      bodyText.includes("Scan QR code") ||
+      bodyText.includes("Link with phone number");
+
+    if (loginScreen) {
+      if (status === "connected") {
+        logger.warn("WhatsApp fue desvinculado desde el teléfono");
         latestQr = null;
         connecting = false;
-        lastDisconnectInfo = null;
+      }
 
+      // Intentar extraer el QR ORIGINAL
+      const qrRef = await page
+        .locator("[data-ref]")
+        .first()
+        .getAttribute("data-ref")
+        .catch(() => null);
+
+      if (qrRef && qrRef.length > 50) {
+        const next = await QRCode.toDataURL(qrRef, {
+          width: 420,
+          margin: 4,
+          errorCorrectionLevel: "M"
+        });
+
+        const changed = next !== latestQr;
+
+        latestQr = next;
+        connecting = false;
+
+        if (status !== "qr_ready" || changed) {
+          lastPairingAt = new Date().toISOString();
+
+          emitStatus("qr_ready");
+
+          io.emit("whatsapp-qr", {
+            qr: latestQr
+          });
+
+          logger.info("WhatsApp desvinculado: nuevo QR generado");
+        }
+
+        return;
+      }
+
+      // Está en login, pero el QR todavía no apareció.
+      latestQr = null;
+
+      if (status !== "loading") {
+        emitStatus("loading");
+      }
+
+      return;
+    }
+
+    // 2. Si NO estamos en login, comprobar interfaz autenticada
+    if (await isConnectedUi()) {
+      latestQr = null;
+      connecting = false;
+      lastDisconnectInfo = null;
+
+      if (status !== "connected") {
         emitStatus("connected");
 
         logger.info("WhatsApp Web connected in Chromium");
@@ -232,131 +297,8 @@ async function refreshState() {
       return;
     }
 
-    // 2. Buscar data-ref ORIGINAL del QR
-    const qrRef = await page
-      .locator("[data-ref]")
-      .first()
-      .getAttribute("data-ref")
-      .catch(() => null);
-
-    if (qrRef && qrRef.length > 50) {
-      const next = await QRCode.toDataURL(qrRef, {
-        width: 420,
-        margin: 4,
-        errorCorrectionLevel: "M"
-      });
-
-      const changed = next !== latestQr;
-
-      latestQr = next;
-      connecting = false;
-
-      if (status !== "qr_ready" || changed) {
-        lastPairingAt = new Date().toISOString();
-
-        emitStatus("qr_ready");
-
-        io.emit("whatsapp-qr", {
-          qr: latestQr
-        });
-
-        logger.info("WhatsApp QR generated directly from data-ref");
-      }
-
-      return;
-    }
-
-    // 3. Detectar EXPLÍCITAMENTE pantalla de login
-    const bodyText = await page.locator("body")
-      .innerText()
-      .catch(() => "");
-
-    const loginScreen =
-      bodyText.includes("Escanea para iniciar sesión") ||
-      bodyText.includes("Escanea el código QR") ||
-      bodyText.includes("Scan QR code") ||
-      bodyText.includes("Link with phone number") ||
-      bodyText.includes("Vincular con el número de teléfono");
-
-    // Si ya estaba conectado y NO vemos pantalla de login,
-    // NO cambiar a loading por un cambio temporal del DOM.
-    if (status === "connected" && !loginScreen) {
-      return;
-    }
-
-    // 4. Fallback visual para encontrar QR
-    const qr = await findQrLocator();
-
-    if (qr) {
-      let next = null;
-
-      next = await qr.evaluate((el) => {
-        if (el instanceof HTMLCanvasElement) {
-          return el.toDataURL("image/png");
-        }
-
-        const canvas = el.querySelector?.("canvas");
-
-        if (canvas instanceof HTMLCanvasElement) {
-          return canvas.toDataURL("image/png");
-        }
-
-        return null;
-      }).catch(() => null);
-
-      if (!next) {
-        next = await qr.evaluate((el) => {
-          let svg = null;
-
-          if (
-            el instanceof SVGElement ||
-            el.tagName?.toLowerCase() === "svg"
-          ) {
-            svg = el;
-          } else {
-            svg = el.querySelector?.("svg");
-          }
-
-          if (!svg) return null;
-
-          const xml = new XMLSerializer().serializeToString(svg);
-
-          return (
-            "data:image/svg+xml;base64," +
-            btoa(unescape(encodeURIComponent(xml)))
-          );
-        }).catch(() => null);
-      }
-
-      if (!next) {
-        const buf = await qr.screenshot({
-          type: "png",
-          animations: "disabled"
-        });
-
-        next = `data:image/png;base64,${buf.toString("base64")}`;
-      }
-
-      const changed = next !== latestQr;
-
-      latestQr = next;
-      connecting = false;
-
-      if (status !== "qr_ready" || changed) {
-        lastPairingAt = new Date().toISOString();
-
-        emitStatus("qr_ready");
-
-        io.emit("whatsapp-qr", {
-          qr: latestQr
-        });
-      }
-
-      return;
-    }
-
-    // 5. Solo usar loading durante una conexión REAL en progreso.
-    // Nunca degradar connected simplemente porque cambió el DOM.
+    // 3. Transición intermedia.
+    // Si estaba conectado, no declararlo desconectado por un cambio fugaz del DOM.
     if (status !== "connected" && status !== "loading") {
       emitStatus("loading");
     }
