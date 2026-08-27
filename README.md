@@ -30,3 +30,7 @@ POST /api/whatsapp/owner-alert
 POST /api/whatsapp/reminder
 GET/POST/DELETE /api/whatsapp/campaigns...
 GET /api/whatsapp/customers
+
+
+## Mensajes POS diferidos
+El mensaje al cliente de tienda física se programa 10 minutos después. La cola se guarda en `/data/pos-message-queue.json`; con un Railway Volume montado en `/data` sobrevive reinicios. La alerta al dueño es inmediata. Las variables `{{puntosGanados}}` y `{{puntosBalance}}` se reciben desde el frontend.

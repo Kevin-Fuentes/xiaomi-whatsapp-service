@@ -13,6 +13,8 @@ const DATA_DIR=process.env.DATA_DIR||"/data";
 const AUTH_DIR=path.join(DATA_DIR,"auth");
 const CONFIG_FILE=path.join(DATA_DIR,"templates.json");
 const CAMPAIGNS_FILE=path.join(DATA_DIR,"campaigns.json");
+const POS_QUEUE_FILE=path.join(DATA_DIR,"pos-message-queue.json");
+const POS_DELAY_MS=Number(process.env.POS_MESSAGE_DELAY_MS||600000);
 const OLD_BACKEND_URL=process.env.OLD_BACKEND_URL||"https://xiaomictg-backend-production.up.railway.app";
 const ORIGINS=(process.env.ALLOWED_ORIGINS||"https://xiaomicartagena.com,https://www.xiaomicartagena.com").split(",").map(x=>x.trim()).filter(Boolean);
 const logger=pino({level:process.env.LOG_LEVEL||"info"});
@@ -76,6 +78,7 @@ app.use(express.json({limit:"8mb"}));
 
 let sock=null,status="disconnected",latestQr=null,connecting=false,reconnectTimer=null;
 const campaignTimers=new Map();
+const posTimers=new Map();
 
 const ensure=()=>fs.mkdir(AUTH_DIR,{recursive:true});
 async function readJson(file,fallback){try{return JSON.parse(await fs.readFile(file,"utf8"))}catch{return fallback}}
@@ -84,6 +87,23 @@ async function loadCfg(){const cfg=await readJson(CONFIG_FILE,null);if(cfg)retur
 async function saveCfg(v){await writeJson(CONFIG_FILE,v)}
 async function loadCampaigns(){return await readJson(CAMPAIGNS_FILE,[])}
 async function saveCampaigns(v){await writeJson(CAMPAIGNS_FILE,v)}
+async function loadPosQueue(){return await readJson(POS_QUEUE_FILE,[])}
+async function savePosQueue(v){await writeJson(POS_QUEUE_FILE,v)}
+async function updatePosJob(id,mutator){const all=await loadPosQueue(),ix=all.findIndex(x=>x.id===id);if(ix<0)return null;mutator(all[ix]);await savePosQueue(all);return all[ix]}
+async function runPosJob(id){
+ posTimers.delete(id);const all=await loadPosQueue(),job=all.find(x=>x.id===id);
+ if(!job||["sent","cancelled"].includes(job.status))return;
+ if(status!=="connected"){await updatePosJob(id,x=>{x.status="pending";x.lastError="WhatsApp no está conectado"});return}
+ try{const cfg=await loadCfg();await sendText(job.telefono,render(cfg.inStoreTemplate,job.vars));await updatePosJob(id,x=>{x.status="sent";x.sentAt=new Date().toISOString();x.lastError=""})}
+ catch(e){await updatePosJob(id,x=>{x.status="pending";x.lastError=e.message||String(e)});logger.error({err:e,posJob:id},"POS delayed message failed")}
+}
+async function schedulePosJob(job){
+ if(posTimers.has(job.id)){clearTimeout(posTimers.get(job.id));posTimers.delete(job.id)}
+ if(["sent","cancelled"].includes(job.status))return;
+ const wait=Math.max(0,new Date(job.sendAt).getTime()-Date.now());
+ posTimers.set(job.id,setTimeout(()=>runPosJob(job.id).catch(e=>logger.error({err:e,posJob:job.id},"POS job")),wait))
+}
+async function resumePosJobs(){for(const job of await loadPosQueue())if(!["sent","cancelled"].includes(job.status))await schedulePosJob(job)}
 function emitStatus(v){status=v;io.emit("whatsapp-status",{status:v})}
 function phone(v){let d=String(v||"").replace(/\D/g,"");if(!d)return"";if(d.startsWith("57")&&d.length===12)return d;if(d.length===10)return"57"+d;return d}
 function render(t,vars){let out=String(t||"");for(const[k,v]of Object.entries(vars||{})){out=out.split(`{{${k}}}`).join(String(v??""));out=out.split(`{{ ${k} }}`).join(String(v??""))}return out}
@@ -100,7 +120,7 @@ async function startWA(force=false){
   sock.ev.on("creds.update",saveCreds);
   sock.ev.on("connection.update",async u=>{
    if(u.qr){latestQr=await QRCode.toDataURL(u.qr,{margin:1,width:320});connecting=false;emitStatus("qr_ready");io.emit("whatsapp-qr",{qr:latestQr})}
-   if(u.connection==="open"){latestQr=null;connecting=false;emitStatus("connected");logger.info("WhatsApp connected");resumeScheduledCampaigns().catch(e=>logger.error({err:e},"resume campaigns"))}
+   if(u.connection==="open"){latestQr=null;connecting=false;emitStatus("connected");logger.info("WhatsApp connected");resumeScheduledCampaigns().catch(e=>logger.error({err:e},"resume campaigns"));resumePosJobs().catch(e=>logger.error({err:e},"resume POS messages"))}
    if(u.connection==="close"){
     connecting=false;
     const code=u.lastDisconnect?.error?.output?.statusCode;
@@ -133,9 +153,10 @@ async function sendImageOrText(to,message,imageUrl){
 async function fetchCustomers(){
  const map=new Map();
  try{
-  const [ordersRes,finRes]=await Promise.allSettled([
+  const [ordersRes,finRes,posRes]=await Promise.allSettled([
    fetch(`${OLD_BACKEND_URL}/api/orders`),
-   fetch(`${OLD_BACKEND_URL}/api/financing`)
+   fetch(`${OLD_BACKEND_URL}/api/financing`),
+   fetch(`${OLD_BACKEND_URL}/api/inventario/ventas`)
   ]);
   if(ordersRes.status==="fulfilled"&&ordersRes.value.ok){
    const raw=await ordersRes.value.json(); const orders=Array.isArray(raw)?raw:(raw.orders||raw.data||[]);
@@ -150,6 +171,13 @@ async function fetchCustomers(){
    for(const c of rows){
     const p=phone(c.telefono||c.phone); if(!p)continue;
     map.set(p,{name:c.nombre||c.customer_name||"Cliente",phone:p,lastPurchaseDate:c.createdAt||c.created_at||null,lastPurchaseProduct:c.producto||"Crédito"});
+   }
+  }
+  if(posRes.status==="fulfilled"&&posRes.value.ok){
+   const raw=await posRes.value.json(); const rows=Array.isArray(raw)?raw:(raw.ventas||raw.data||[]);
+   for(const c of rows){
+    const p=phone(c.telefono||c.phone);if(!p)continue;
+    map.set(p,{name:c.cliente||c.nombre||"Cliente",phone:p,lastPurchaseDate:c.fecha||c.createdAt||c.created_at||null,lastPurchaseProduct:c.producto||"Compra en tienda"});
    }
   }
  }catch(e){logger.warn({err:e},"fetchCustomers")}
@@ -215,11 +243,15 @@ app.post("/api/whatsapp/order",async(req,res)=>{try{
 
 app.post("/api/whatsapp/in-store",async(req,res)=>{try{
  const cfg=await loadCfg(),b=req.body||{};
- const vars={nombre:b.nombre||"Cliente",ordenNumero:b.ordenNumero||"",productos:b.producto||"",producto:b.producto||"",total:b.total||"",metodoPago:b.metodoPago||"",metodoEntrega:"Tienda física",linea_direccion:"",telefono:b.telefono||"",email:b.email||"",cedula:b.cedula||"",fecha:b.fecha||new Date().toLocaleString("es-CO")};
- const sent=[];
- if(b.telefono){await sendText(b.telefono,render(cfg.inStoreTemplate,vars));sent.push("customer")}
- if(cfg.ownerPhone){await sendText(cfg.ownerPhone,render(cfg.ownerTemplate,vars));sent.push("owner")}
- res.json({success:true,sent});
+ const vars={nombre:b.nombre||"Cliente",ordenNumero:b.ordenNumero||"",productos:b.producto||"",producto:b.producto||"",total:b.total||"",metodoPago:b.metodoPago||"",metodoEntrega:"Tienda física",linea_direccion:"",telefono:b.telefono||"",email:b.email||"",cedula:b.cedula||"",fecha:b.fecha||new Date().toLocaleString("es-CO"),puntosGanados:Number(b.puntosGanados||0).toLocaleString("es-CO"),puntosBalance:Number(b.puntosBalance||0).toLocaleString("es-CO")};
+ const result={success:true,ownerSent:false,customerScheduled:false};
+ if(cfg.ownerPhone){await sendText(cfg.ownerPhone,render(cfg.ownerTemplate,vars));result.ownerSent=true}
+ if(b.telefono){
+  const now=Date.now(),job={id:`POS-${now}-${Math.random().toString(36).slice(2,8)}`,telefono:b.telefono,vars,createdAt:new Date(now).toISOString(),sendAt:new Date(now+POS_DELAY_MS).toISOString(),status:"pending",sentAt:null,lastError:""};
+  const queue=await loadPosQueue();queue.push(job);await savePosQueue(queue);await schedulePosJob(job);
+  result.customerScheduled=true;result.sendAt=job.sendAt;result.delayMinutes=Math.round(POS_DELAY_MS/60000)
+ }
+ res.json(result);
 }catch(e){res.status(503).json({success:false,error:e.message})}});
 
 app.post("/api/whatsapp/owner-alert",async(req,res)=>{try{
@@ -240,6 +272,7 @@ _Xiaomi Cartagena_`;
 }catch(e){res.status(503).json({success:false,error:e.message})}});
 
 app.get("/api/whatsapp/customers",async(req,res)=>{res.json(await fetchCustomers())});
+app.get("/api/whatsapp/pos-queue",async(req,res)=>{const q=await loadPosQueue();res.json(q.slice().reverse())});
 app.get("/api/whatsapp/campaigns",async(req,res)=>res.json(await loadCampaigns()));
 app.post("/api/whatsapp/campaigns",async(req,res)=>{try{
  const b=req.body||{};if(!b.name||!b.message||!Array.isArray(b.recipients)||!b.recipients.length)return res.status(400).json({error:"name, message y recipients requeridos"});
@@ -255,4 +288,4 @@ app.post("/api/whatsapp/campaigns/:id/status",async(req,res)=>{try{
 app.delete("/api/whatsapp/campaigns/:id",async(req,res)=>{const all=await loadCampaigns(),next=all.filter(c=>c.id!==req.params.id);if(next.length===all.length)return res.status(404).json({error:"Campaña no encontrada"});if(campaignTimers.has(req.params.id)){clearTimeout(campaignTimers.get(req.params.id));campaignTimers.delete(req.params.id)}await saveCampaigns(next);res.json({success:true})});
 
 io.on("connection",s=>{s.emit("whatsapp-status",{status});if(latestQr)s.emit("whatsapp-qr",{qr:latestQr})});
-server.listen(PORT,"0.0.0.0",async()=>{await ensure();logger.info({PORT,ORIGINS,OLD_BACKEND_URL},"server started");await resumeScheduledCampaigns();if(process.env.AUTO_CONNECT==="true")startWA().catch(()=>{})});
+server.listen(PORT,"0.0.0.0",async()=>{await ensure();logger.info({PORT,ORIGINS,OLD_BACKEND_URL},"server started");await resumeScheduledCampaigns();await resumePosJobs();if(process.env.AUTO_CONNECT==="true")startWA().catch(()=>{})});
