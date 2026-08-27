@@ -430,7 +430,52 @@ app.post("/api/whatsapp/reset-session",async(req,res)=>{
  try{await clearProfile();emitStatus("disconnected");lastDisconnectInfo=null;lastPairingAt=null;logger.info({profileDir:PROFILE_DIR},"WhatsApp Chromium profile reset");res.json({success:true,message:"Sesión de WhatsApp eliminada. Ya puedes generar un QR nuevo.",status})}
  catch(error){logger.error({err:error},"reset-session failed");res.status(500).json({success:false,error:error.message})}
 });
+app.get("/api/whatsapp/debug-screenshot", async (req, res) => {
+  try {
+    if (!page || page.isClosed()) {
+      return res.status(503).json({
+        success: false,
+        error: "Chromium no tiene una página activa"
+      });
+    }
 
+    const screenshot = await page.screenshot({
+      fullPage: true,
+      type: "png"
+    });
+
+    res.setHeader("Content-Type", "image/png");
+    res.send(screenshot);
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.get("/api/whatsapp/debug-page", async (req, res) => {
+  try {
+    if (!page || page.isClosed()) {
+      return res.status(503).json({
+        success: false,
+        error: "Chromium no tiene una página activa"
+      });
+    }
+
+    res.json({
+      success: true,
+      url: page.url(),
+      title: await page.title(),
+      text: (await page.locator("body").innerText()).slice(0, 5000)
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
 app.get("/api/whatsapp/templates",async(req,res)=>res.json(await loadCfg()));
 app.put("/api/whatsapp/templates",async(req,res)=>{const next={...(await loadCfg()),...req.body};await saveCfg(next);res.json({success:true,...next})});
 
