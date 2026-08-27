@@ -127,23 +127,59 @@ async function clearProfile(){
  await ensure();
 }
 
-async function findQrLocator(){
- if(!page||page.isClosed())return null;
- const canvases=page.locator("canvas");
- const count=await canvases.count().catch(()=>0);
- for(let i=0;i<count;i++){
-  const loc=canvases.nth(i);
-  const box=await loc.boundingBox().catch(()=>null);
-  if(box&&box.width>=180&&box.height>=180&&Math.abs(box.width-box.height)<80)return loc;
- }
- const refs=page.locator('div[data-ref]');
- const rc=await refs.count().catch(()=>0);
- for(let i=0;i<rc;i++){
-  const loc=refs.nth(i);
-  const box=await loc.boundingBox().catch(()=>null);
-  if(box&&box.width>=180&&box.height>=180)return loc;
- }
- return null;
+async function findQrLocator() {
+  if (!page || page.isClosed()) return null;
+
+  // 1. Canvas tradicional
+  const canvas = page.locator("canvas").filter({
+    has: page.locator("xpath=..")
+  });
+
+  const canvasCount = await page.locator("canvas").count().catch(() => 0);
+
+  for (let i = 0; i < canvasCount; i++) {
+    const loc = page.locator("canvas").nth(i);
+    const box = await loc.boundingBox().catch(() => null);
+
+    if (
+      box &&
+      box.width >= 180 &&
+      box.height >= 180 &&
+      Math.abs(box.width - box.height) < 100
+    ) {
+      return loc;
+    }
+  }
+
+  // 2. QR moderno basado en SVG
+  const svgCount = await page.locator("svg").count().catch(() => 0);
+
+  for (let i = 0; i < svgCount; i++) {
+    const loc = page.locator("svg").nth(i);
+    const box = await loc.boundingBox().catch(() => null);
+
+    if (
+      box &&
+      box.width >= 180 &&
+      box.height >= 180 &&
+      Math.abs(box.width - box.height) < 100
+    ) {
+      return loc;
+    }
+  }
+
+  // 3. Contenedor usado por WhatsApp
+  const dataRef = page.locator("[data-ref]").first();
+
+  if (await dataRef.count().catch(() => 0)) {
+    const box = await dataRef.boundingBox().catch(() => null);
+
+    if (box && box.width >= 180 && box.height >= 180) {
+      return dataRef;
+    }
+  }
+
+  return null;
 }
 
 async function isConnectedUi(){
@@ -187,47 +223,78 @@ async function refreshState() {
     // 2. Buscar QR
     const qr = await findQrLocator();
 
-    if (qr) {
-      const next = await qr.evaluate((el) => {
-        if (el instanceof HTMLCanvasElement) {
-          return el.toDataURL("image/png");
-        }
+  if (qr) {
+  let next = null;
 
-        const innerCanvas = el.querySelector?.("canvas");
-
-        if (innerCanvas instanceof HTMLCanvasElement) {
-          return innerCanvas.toDataURL("image/png");
-        }
-
-        return null;
-      });
-
-      if (!next) {
-        logger.warn(
-          "No se pudo extraer el QR directamente del canvas"
-        );
-        return;
-      }
-
-      const changed = next !== latestQr;
-
-      latestQr = next;
-      connecting = false;
-
-      if (status !== "qr_ready" || changed) {
-        lastPairingAt = new Date().toISOString();
-
-        emitStatus("qr_ready");
-
-        io.emit("whatsapp-qr", {
-          qr: latestQr
-        });
-
-        logger.info("WhatsApp Web QR ready");
-      }
-
-      return;
+  // Canvas real
+  next = await qr.evaluate((el) => {
+    if (el instanceof HTMLCanvasElement) {
+      return el.toDataURL("image/png");
     }
+
+    const canvas = el.querySelector?.("canvas");
+
+    if (canvas instanceof HTMLCanvasElement) {
+      return canvas.toDataURL("image/png");
+    }
+
+    return null;
+  }).catch(() => null);
+
+  // SVG: convertirlo directamente a data URL
+  if (!next) {
+    next = await qr.evaluate((el) => {
+      let svg = null;
+
+      if (
+        el instanceof SVGElement ||
+        el.tagName?.toLowerCase() === "svg"
+      ) {
+        svg = el;
+      } else {
+        svg = el.querySelector?.("svg");
+      }
+
+      if (!svg) return null;
+
+      const xml = new XMLSerializer().serializeToString(svg);
+
+      return (
+        "data:image/svg+xml;base64," +
+        btoa(unescape(encodeURIComponent(xml)))
+      );
+    }).catch(() => null);
+  }
+
+  // Último fallback: screenshot SOLO del QR
+  if (!next) {
+    const buf = await qr.screenshot({
+      type: "png",
+      animations: "disabled"
+    });
+
+    next = `data:image/png;base64,${buf.toString("base64")}`;
+  }
+
+  const changed = next !== latestQr;
+
+  latestQr = next;
+  connecting = false;
+
+  if (status !== "qr_ready" || changed) {
+    lastPairingAt = new Date().toISOString();
+
+    emitStatus("qr_ready");
+
+    io.emit("whatsapp-qr", {
+      qr: latestQr
+    });
+
+    logger.info("WhatsApp Web QR ready");
+  }
+
+  return;
+}
 
     // 3. Si todavía no hay QR ni conexión
     if (status !== "loading") {
