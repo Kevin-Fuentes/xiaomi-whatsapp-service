@@ -183,22 +183,33 @@ async function findQrLocator() {
   return null;
 }
 
-async function isConnectedUi(){
- if(!page||page.isClosed())return false;
- if(await page.locator("#pane-side").count().catch(()=>0))return true;
- const selectors=[
-  '[data-testid="chat-list"]',
-  'div[aria-label*="Chat list"]',
-  'div[aria-label*="Lista de chats"]'
- ];
- for(const sel of selectors)if(await page.locator(sel).count().catch(()=>0))return true;
- return false;
+async function isConnectedUi() {
+  if (!page || page.isClosed()) return false;
+
+  const selectors = [
+    "#pane-side",
+    "#main",
+    '[data-testid="chat-list"]',
+    'div[aria-label*="Chat list"]',
+    'div[aria-label*="Lista de chats"]',
+    '[role="grid"]'
+  ];
+
+  for (const sel of selectors) {
+    const count = await page.locator(sel).count().catch(() => 0);
+
+    if (count > 0) {
+      return true;
+    }
+  }
+
+  return false;
 }
 async function refreshState() {
   if (!page || page.isClosed()) return;
 
   try {
-    // 1. Primero comprobar si WhatsApp YA está conectado
+    // 1. Detectar claramente la interfaz conectada
     if (await isConnectedUi()) {
       if (status !== "connected") {
         latestQr = null;
@@ -221,8 +232,7 @@ async function refreshState() {
       return;
     }
 
-    // 2. Intentar obtener el contenido ORIGINAL del QR de WhatsApp.
-    // Evita screenshots/redimensionados que pueden volver el QR difícil de escanear.
+    // 2. Buscar data-ref ORIGINAL del QR
     const qrRef = await page
       .locator("[data-ref]")
       .first()
@@ -237,97 +247,117 @@ async function refreshState() {
       });
 
       const changed = next !== latestQr;
+
       latestQr = next;
       connecting = false;
 
       if (status !== "qr_ready" || changed) {
         lastPairingAt = new Date().toISOString();
+
         emitStatus("qr_ready");
-        io.emit("whatsapp-qr", { qr: latestQr });
+
+        io.emit("whatsapp-qr", {
+          qr: latestQr
+        });
+
         logger.info("WhatsApp QR generated directly from data-ref");
       }
 
       return;
     }
 
-    // 3. Fallback: canvas / SVG / contenedor visual
+    // 3. Detectar EXPLÍCITAMENTE pantalla de login
+    const bodyText = await page.locator("body")
+      .innerText()
+      .catch(() => "");
+
+    const loginScreen =
+      bodyText.includes("Escanea para iniciar sesión") ||
+      bodyText.includes("Escanea el código QR") ||
+      bodyText.includes("Scan QR code") ||
+      bodyText.includes("Link with phone number") ||
+      bodyText.includes("Vincular con el número de teléfono");
+
+    // Si ya estaba conectado y NO vemos pantalla de login,
+    // NO cambiar a loading por un cambio temporal del DOM.
+    if (status === "connected" && !loginScreen) {
+      return;
+    }
+
+    // 4. Fallback visual para encontrar QR
     const qr = await findQrLocator();
 
-  if (qr) {
-  let next = null;
+    if (qr) {
+      let next = null;
 
-  // Canvas real
-  next = await qr.evaluate((el) => {
-    if (el instanceof HTMLCanvasElement) {
-      return el.toDataURL("image/png");
-    }
+      next = await qr.evaluate((el) => {
+        if (el instanceof HTMLCanvasElement) {
+          return el.toDataURL("image/png");
+        }
 
-    const canvas = el.querySelector?.("canvas");
+        const canvas = el.querySelector?.("canvas");
 
-    if (canvas instanceof HTMLCanvasElement) {
-      return canvas.toDataURL("image/png");
-    }
+        if (canvas instanceof HTMLCanvasElement) {
+          return canvas.toDataURL("image/png");
+        }
 
-    return null;
-  }).catch(() => null);
+        return null;
+      }).catch(() => null);
 
-  // SVG: convertirlo directamente a data URL
-  if (!next) {
-    next = await qr.evaluate((el) => {
-      let svg = null;
+      if (!next) {
+        next = await qr.evaluate((el) => {
+          let svg = null;
 
-      if (
-        el instanceof SVGElement ||
-        el.tagName?.toLowerCase() === "svg"
-      ) {
-        svg = el;
-      } else {
-        svg = el.querySelector?.("svg");
+          if (
+            el instanceof SVGElement ||
+            el.tagName?.toLowerCase() === "svg"
+          ) {
+            svg = el;
+          } else {
+            svg = el.querySelector?.("svg");
+          }
+
+          if (!svg) return null;
+
+          const xml = new XMLSerializer().serializeToString(svg);
+
+          return (
+            "data:image/svg+xml;base64," +
+            btoa(unescape(encodeURIComponent(xml)))
+          );
+        }).catch(() => null);
       }
 
-      if (!svg) return null;
+      if (!next) {
+        const buf = await qr.screenshot({
+          type: "png",
+          animations: "disabled"
+        });
 
-      const xml = new XMLSerializer().serializeToString(svg);
+        next = `data:image/png;base64,${buf.toString("base64")}`;
+      }
 
-      return (
-        "data:image/svg+xml;base64," +
-        btoa(unescape(encodeURIComponent(xml)))
-      );
-    }).catch(() => null);
-  }
+      const changed = next !== latestQr;
 
-  // Último fallback: screenshot SOLO del QR
-  if (!next) {
-    const buf = await qr.screenshot({
-      type: "png",
-      animations: "disabled"
-    });
+      latestQr = next;
+      connecting = false;
 
-    next = `data:image/png;base64,${buf.toString("base64")}`;
-  }
+      if (status !== "qr_ready" || changed) {
+        lastPairingAt = new Date().toISOString();
 
-  const changed = next !== latestQr;
+        emitStatus("qr_ready");
 
-  latestQr = next;
-  connecting = false;
+        io.emit("whatsapp-qr", {
+          qr: latestQr
+        });
+      }
 
-  if (status !== "qr_ready" || changed) {
-    lastPairingAt = new Date().toISOString();
+      return;
+    }
 
-    emitStatus("qr_ready");
-
-    io.emit("whatsapp-qr", {
-      qr: latestQr
-    });
-
-    logger.info("WhatsApp Web QR ready");
-  }
-
-  return;
-}
-
-    // 4. Si todavía no hay QR ni conexión
-    if (status !== "loading") {
+    // 5. Solo usar loading durante una conexión REAL en progreso.
+    // Nunca degradar connected simplemente porque cambió el DOM.
+    if (status !== "connected" && status !== "loading") {
       emitStatus("loading");
     }
 
@@ -338,7 +368,6 @@ async function refreshState() {
     );
   }
 }
-
 async function startWA(force=false){
  if(connecting&&!force)return;
  if(context&&!force){
