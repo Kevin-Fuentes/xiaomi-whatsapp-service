@@ -7,6 +7,7 @@ import fs from "fs/promises";
 import path from "path";
 import os from "os";
 import {chromium} from "playwright";
+import QRCode from "qrcode";
 
 const PORT=Number(process.env.PORT||3000);
 const DATA_DIR=process.env.DATA_DIR||"/data";
@@ -220,7 +221,36 @@ async function refreshState() {
       return;
     }
 
-    // 2. Buscar QR
+    // 2. Intentar obtener el contenido ORIGINAL del QR de WhatsApp.
+    // Evita screenshots/redimensionados que pueden volver el QR difícil de escanear.
+    const qrRef = await page
+      .locator("[data-ref]")
+      .first()
+      .getAttribute("data-ref")
+      .catch(() => null);
+
+    if (qrRef && qrRef.length > 50) {
+      const next = await QRCode.toDataURL(qrRef, {
+        width: 420,
+        margin: 4,
+        errorCorrectionLevel: "M"
+      });
+
+      const changed = next !== latestQr;
+      latestQr = next;
+      connecting = false;
+
+      if (status !== "qr_ready" || changed) {
+        lastPairingAt = new Date().toISOString();
+        emitStatus("qr_ready");
+        io.emit("whatsapp-qr", { qr: latestQr });
+        logger.info("WhatsApp QR generated directly from data-ref");
+      }
+
+      return;
+    }
+
+    // 3. Fallback: canvas / SVG / contenedor visual
     const qr = await findQrLocator();
 
   if (qr) {
@@ -296,7 +326,7 @@ async function refreshState() {
   return;
 }
 
-    // 3. Si todavía no hay QR ni conexión
+    // 4. Si todavía no hay QR ni conexión
     if (status !== "loading") {
       emitStatus("loading");
     }
