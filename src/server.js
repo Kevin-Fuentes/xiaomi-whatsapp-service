@@ -77,6 +77,7 @@ app.use(cors({origin:(origin,cb)=>!origin||ORIGINS.includes(origin)?cb(null,true
 app.use(express.json({limit:"8mb"}));
 
 let sock=null,status="disconnected",latestQr=null,connecting=false,reconnectTimer=null;
+let socketGeneration=0,lastDisconnectInfo=null,lastWaWebVersion=null,lastPairingAt=null;
 const campaignTimers=new Map();
 const posTimers=new Map();
 
@@ -108,28 +109,169 @@ function emitStatus(v){status=v;io.emit("whatsapp-status",{status:v})}
 function phone(v){let d=String(v||"").replace(/\D/g,"");if(!d)return"";if(d.startsWith("57")&&d.length===12)return d;if(d.length===10)return"57"+d;return d}
 function render(t,vars){let out=String(t||"");for(const[k,v]of Object.entries(vars||{})){out=out.split(`{{${k}}}`).join(String(v??""));out=out.split(`{{ ${k} }}`).join(String(v??""))}return out}
 async function clearAuth(){await fs.rm(AUTH_DIR,{recursive:true,force:true});await ensure()}
-async function startWA(force=false){
- if(connecting&&!force)return;
- connecting=true;latestQr=null;emitStatus("loading");
+
+async function fetchLiveWaWebVersion(){
  try{
-  await ensure();
-  if(force&&sock){try{sock.end(new Error("force"))}catch{} sock=null}
-  const {state,saveCreds}=await useMultiFileAuthState(AUTH_DIR);
-  const {version}=await fetchLatestBaileysVersion();
-  sock=makeWASocket({version,auth:state,logger,browser:Browsers.ubuntu("Chrome"),printQRInTerminal:false,markOnlineOnConnect:false,syncFullHistory:false,generateHighQualityLinkPreview:false});
-  sock.ev.on("creds.update",saveCreds);
-  sock.ev.on("connection.update",async u=>{
-   if(u.qr){latestQr=await QRCode.toDataURL(u.qr,{margin:1,width:320});connecting=false;emitStatus("qr_ready");io.emit("whatsapp-qr",{qr:latestQr})}
-   if(u.connection==="open"){latestQr=null;connecting=false;emitStatus("connected");logger.info("WhatsApp connected");resumeScheduledCampaigns().catch(e=>logger.error({err:e},"resume campaigns"));resumePosJobs().catch(e=>logger.error({err:e},"resume POS messages"))}
-   if(u.connection==="close"){
-    connecting=false;
-    const code=u.lastDisconnect?.error?.output?.statusCode;
-    logger.warn({code,error:u.lastDisconnect?.error?.message},"WhatsApp closed");
-    if(code===DisconnectReason.loggedOut){latestQr=null;emitStatus("disconnected");await clearAuth();return}
-    emitStatus("loading");clearTimeout(reconnectTimer);reconnectTimer=setTimeout(()=>startWA(true).catch(()=>{}),3000);
+  const response=await fetch("https://web.whatsapp.com/sw.js",{
+   headers:{
+    "sec-fetch-site":"none",
+    "user-agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
    }
   });
- }catch(e){connecting=false;logger.error({err:e},"startWA failed");emitStatus("disconnected")}
+  if(!response.ok)throw new Error(`sw.js HTTP ${response.status}`);
+  const body=await response.text();
+  const match=body.match(/\\"?client_revision\\"?\s*:\s*(\d+)/);
+  if(!match?.[1])throw new Error("client_revision no encontrado");
+  const version=[2,3000,Number(match[1])];
+  lastWaWebVersion={source:"web.whatsapp.com",version,at:new Date().toISOString()};
+  return version;
+ }catch(err){
+  logger.warn({err:err?.message||String(err)},"No se pudo obtener WA Web live version; usando fallback Baileys");
+  const fallback=await fetchLatestBaileysVersion();
+  lastWaWebVersion={source:"baileys-fallback",version:fallback.version,at:new Date().toISOString(),error:err?.message||String(err)};
+  return fallback.version;
+ }
+}
+
+function disconnectCode(error){
+ return error?.output?.statusCode||error?.data?.statusCode||error?.statusCode||null;
+}
+
+function safeEndSocket(reason="replace"){
+ if(!sock)return;
+ try{sock.ev?.removeAllListeners?.("connection.update")}catch{}
+ try{sock.end(new Error(reason))}catch{}
+ sock=null;
+}
+async function startWA(force=false){
+ if(connecting&&!force)return;
+ const generation=++socketGeneration;
+ connecting=true;
+ latestQr=null;
+ emitStatus("loading");
+
+ try{
+  await ensure();
+
+  if(force){
+   clearTimeout(reconnectTimer);
+   reconnectTimer=null;
+   safeEndSocket("forced reconnect");
+  }else if(sock){
+   safeEndSocket("new connection");
+  }
+
+  const {state,saveCreds}=await useMultiFileAuthState(AUTH_DIR);
+  const version=await fetchLiveWaWebVersion();
+
+  logger.info({
+   generation,
+   version:version.join("."),
+   registered:Boolean(state.creds?.registered)
+  },"Starting WhatsApp Business compatible socket");
+
+  const localSock=makeWASocket({
+   version,
+   auth:state,
+   logger,
+   browser:Browsers.macOS("Chrome"),
+   printQRInTerminal:false,
+   markOnlineOnConnect:false,
+   syncFullHistory:false,
+   generateHighQualityLinkPreview:false,
+   connectTimeoutMs:120000,
+   keepAliveIntervalMs:10000,
+   qrTimeout:180000,
+   defaultQueryTimeoutMs:undefined,
+   shouldSyncHistoryMessage:()=>false,
+   getMessage:async()=>undefined
+  });
+
+  sock=localSock;
+  localSock.ev.on("creds.update",saveCreds);
+
+  localSock.ev.on("connection.update",async update=>{
+   if(generation!==socketGeneration)return;
+
+   const {connection,lastDisconnect,qr}=update;
+
+   if(qr){
+    lastPairingAt=new Date().toISOString();
+    latestQr=await QRCode.toDataURL(qr,{margin:1,width:320});
+    connecting=false;
+    emitStatus("qr_ready");
+    io.emit("whatsapp-qr",{qr:latestQr});
+    logger.info({generation,version:version.join(".")},"Fresh WhatsApp QR generated");
+   }
+
+   if(connection==="open"){
+    latestQr=null;
+    connecting=false;
+    lastDisconnectInfo=null;
+    emitStatus("connected");
+    logger.info({
+     generation,
+     version:version.join("."),
+     registered:Boolean(state.creds?.registered),
+     user:localSock.user?.id||null
+    },"WhatsApp Business linked successfully");
+    resumeScheduledCampaigns().catch(e=>logger.error({err:e},"resume campaigns"));
+    resumePosJobs().catch(e=>logger.error({err:e},"resume POS messages"));
+   }
+
+   if(connection==="close"){
+    connecting=false;
+    const err=lastDisconnect?.error;
+    const code=disconnectCode(err);
+    const message=err?.message||String(err||"");
+    const registered=Boolean(state.creds?.registered);
+
+    lastDisconnectInfo={
+     code,message,registered,
+     at:new Date().toISOString(),
+     version:version.join(".")
+    };
+
+    logger.warn(lastDisconnectInfo,"WhatsApp connection closed");
+
+    // 401 means WhatsApp invalidated/removed this companion.
+    if(code===DisconnectReason.loggedOut||code===401){
+     latestQr=null;
+     emitStatus("disconnected");
+     safeEndSocket("logged out/device removed");
+     await clearAuth();
+     logger.warn("Auth cleared after 401/device_removed. Generate a fresh QR.");
+     return;
+    }
+
+    // 515 = restart required after pairing or protocol transition.
+    if(code===515){
+     emitStatus("loading");
+     clearTimeout(reconnectTimer);
+     reconnectTimer=setTimeout(()=>startWA(true).catch(e=>logger.error({err:e},"restartRequired reconnect")),1500);
+     return;
+    }
+
+    // 408/428 can happen during initial sync. Avoid aggressive reconnect loops.
+    if(code===408||code===428){
+     emitStatus("loading");
+     clearTimeout(reconnectTimer);
+     reconnectTimer=setTimeout(()=>startWA(true).catch(e=>logger.error({err:e},"delayed reconnect")),8000);
+     return;
+    }
+
+    emitStatus("loading");
+    clearTimeout(reconnectTimer);
+    reconnectTimer=setTimeout(()=>startWA(true).catch(e=>logger.error({err:e},"generic reconnect")),5000);
+   }
+  });
+
+ }catch(e){
+  connecting=false;
+  lastDisconnectInfo={code:null,message:e?.message||String(e),registered:null,at:new Date().toISOString(),version:lastWaWebVersion?.version?.join?.(".")||null};
+  logger.error({err:e},"startWA failed");
+  emitStatus("disconnected");
+ }
 }
 async function sendText(to,text){
  if(!sock||status!=="connected")throw new Error("WhatsApp no está conectado");
@@ -224,45 +366,33 @@ async function resumeScheduledCampaigns(){for(const c of await loadCampaigns())i
 
 app.get("/health",(req,res)=>res.json({ok:true,service:"xiaomi-whatsapp-service",status}));
 app.get("/api/whatsapp/status",(req,res)=>res.json({status,qr:latestQr}));
+app.get("/api/whatsapp/diagnostics",(req,res)=>res.json({
+ status,
+ connecting,
+ hasQr:Boolean(latestQr),
+ lastPairingAt,
+ lastWaWebVersion,
+ lastDisconnect:lastDisconnectInfo,
+ authDir:AUTH_DIR,
+ dataDir:DATA_DIR
+}));
 app.post("/api/whatsapp/connect",(req,res)=>{startWA(Boolean(req.body?.force)).catch(()=>{});res.json({success:true,status,qr:latestQr})});
 app.post("/api/whatsapp/disconnect",async(req,res)=>{clearTimeout(reconnectTimer);reconnectTimer=null;try{if(sock){try{await sock.logout()}catch{}try{sock.end(new Error("manual"))}catch{}}}finally{sock=null;latestQr=null;connecting=false;await clearAuth();emitStatus("disconnected")}res.json({success:true,status})});
-app.post("/api/whatsapp/reset-session", async (req, res) => {
-  try {
-    const authPath = path.join(DATA_DIR, "auth");
 
-    try {
-      if (sock) {
-        sock.end(undefined);
-        sock = null;
-      }
-    } catch (e) {
-      console.warn("Error cerrando socket:", e.message);
-    }
-
-    await fs.rm(authPath, {
-      recursive: true,
-      force: true
-    });
-
-    status = "disconnected";
-    latestQr = null;
-
-    console.log("WhatsApp auth session deleted:", authPath);
-
-    res.json({
-      success: true,
-      message: "Sesión de WhatsApp eliminada"
-    });
-
-  } catch (error) {
-    console.error("Error resetting WhatsApp session:", error);
-
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
+app.post("/api/whatsapp/reset-session",async(req,res)=>{try{
+ clearTimeout(reconnectTimer);reconnectTimer=null;
+ socketGeneration++;
+ safeEndSocket("reset-session");
+ connecting=false;latestQr=null;
+ await clearAuth();
+ emitStatus("disconnected");
+ lastDisconnectInfo=null;lastPairingAt=null;
+ logger.info({authDir:AUTH_DIR},"WhatsApp auth session reset");
+ res.json({success:true,message:"Sesión de WhatsApp eliminada. Ya puedes generar un QR nuevo.",status});
+}catch(error){
+ logger.error({err:error},"reset-session failed");
+ res.status(500).json({success:false,error:error.message});
+}});
 
 app.get("/api/whatsapp/templates",async(req,res)=>res.json(await loadCfg()));
 app.put("/api/whatsapp/templates",async(req,res)=>{const next={...(await loadCfg()),...req.body};await saveCfg(next);res.json({success:true,...next})});
