@@ -25,7 +25,7 @@ Hola *{{nombre}}*, gracias por tu compra. 🧡
 🛍️ *Tus productos:*
 {{productos}}
 
-💰 *Total:* ${{total}} COP
+💰 *Total:* \${{total}} COP
 💳 *Pago:* {{metodoPago}}
 🚚 *Entrega:* {{metodoEntrega}}
 {{linea_direccion}}
@@ -44,7 +44,7 @@ _Xiaomi Cartagena — Cl. 31 #61-64, Los Ángeles_`,
 🛍️ *Productos:*
 {{productos}}
 
-💰 *Total:* ${{total}} COP
+💰 *Total:* \${{total}} COP
 💳 *Pago:* {{metodoPago}}
 🚚 *Entrega:* {{metodoEntrega}}
 {{linea_direccion}}
@@ -58,7 +58,7 @@ Hola *{{nombre}}*, gracias por visitarnos en nuestra tienda física. 🧡
 🛍️ *Tu compra:*
 • {{producto}}
 
-💰 *Total:* ${{total}} COP
+💰 *Total:* \${{total}} COP
 💳 *Método de pago:* {{metodoPago}}
 📄 *Facturado a:* {{cedula}}
 
@@ -126,3 +126,4 @@ Si ya realizaste el pago, puedes omitir este mensaje.
 _Xiaomi Cartagena_`;await sendText(b.phone,msg);res.json({success:true})}catch(e){res.status(503).json({success:false,error:e.message})}});
 io.on("connection",s=>{s.emit("whatsapp-status",{status});if(latestQr)s.emit("whatsapp-qr",{qr:latestQr})});
 server.listen(PORT,"0.0.0.0",async()=>{await ensure();logger.info({PORT,ORIGINS},"server started");if(process.env.AUTO_CONNECT==="true")startWA().catch(()=>{})});
+
