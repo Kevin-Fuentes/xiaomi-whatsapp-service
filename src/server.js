@@ -157,39 +157,89 @@ async function isConnectedUi(){
  for(const sel of selectors)if(await page.locator(sel).count().catch(()=>0))return true;
  return false;
 }
+async function refreshState() {
+  if (!page || page.isClosed()) return;
 
-async function refreshState(){
- if(!page||page.isClosed())return;
- try{
-  if(await isConnectedUi()){
-   if(status!=="connected"){
-    latestQr=null;connecting=false;lastDisconnectInfo=null;emitStatus("connected");
-    logger.info("WhatsApp Web connected in Chromium");
-    resumeScheduledCampaigns().catch(e=>logger.error({err:e},"resume campaigns"));
-    resumePosJobs().catch(e=>logger.error({err:e},"resume POS messages"));
-   }
-   return;
+  try {
+    // 1. Primero comprobar si WhatsApp YA está conectado
+    if (await isConnectedUi()) {
+      if (status !== "connected") {
+        latestQr = null;
+        connecting = false;
+        lastDisconnectInfo = null;
+
+        emitStatus("connected");
+
+        logger.info("WhatsApp Web connected in Chromium");
+
+        resumeScheduledCampaigns().catch(e =>
+          logger.error({ err: e }, "resume campaigns")
+        );
+
+        resumePosJobs().catch(e =>
+          logger.error({ err: e }, "resume POS messages")
+        );
+      }
+
+      return;
+    }
+
+    // 2. Buscar QR
+    const qr = await findQrLocator();
+
+    if (qr) {
+      const next = await qr.evaluate((el) => {
+        if (el instanceof HTMLCanvasElement) {
+          return el.toDataURL("image/png");
+        }
+
+        const innerCanvas = el.querySelector?.("canvas");
+
+        if (innerCanvas instanceof HTMLCanvasElement) {
+          return innerCanvas.toDataURL("image/png");
+        }
+
+        return null;
+      });
+
+      if (!next) {
+        logger.warn(
+          "No se pudo extraer el QR directamente del canvas"
+        );
+        return;
+      }
+
+      const changed = next !== latestQr;
+
+      latestQr = next;
+      connecting = false;
+
+      if (status !== "qr_ready" || changed) {
+        lastPairingAt = new Date().toISOString();
+
+        emitStatus("qr_ready");
+
+        io.emit("whatsapp-qr", {
+          qr: latestQr
+        });
+
+        logger.info("WhatsApp Web QR ready");
+      }
+
+      return;
+    }
+
+    // 3. Si todavía no hay QR ni conexión
+    if (status !== "loading") {
+      emitStatus("loading");
+    }
+
+  } catch (e) {
+    logger.warn(
+      { err: e?.message || String(e) },
+      "refreshState failed"
+    );
   }
-
-  const qr=await findQrLocator();
-  if(qr){
-   const buf=await qr.screenshot({type:"png"});
-   const next=`data:image/png;base64,${buf.toString("base64")}`;
-   const changed=next!==latestQr;
-   latestQr=next;connecting=false;
-   if(status!=="qr_ready"||changed){
-    lastPairingAt=new Date().toISOString();
-    emitStatus("qr_ready");
-    io.emit("whatsapp-qr",{qr:latestQr});
-    logger.info("WhatsApp Web QR ready");
-   }
-   return;
-  }
-
-  if(status!=="loading")emitStatus("loading");
- }catch(e){
-  logger.warn({err:e?.message||String(e)},"refreshState failed");
- }
 }
 
 async function startWA(force=false){
