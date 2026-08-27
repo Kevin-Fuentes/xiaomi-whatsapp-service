@@ -80,6 +80,7 @@ app.use(express.json({limit:"8mb"}));
 
 let context=null,page=null,status="disconnected",latestQr=null,connecting=false;
 let monitorTimer=null,lastPairingAt=null,lastDisconnectInfo=null,lastBrowserInfo=null;
+let connectGeneration=0,loadingSince=null;
 let sendChain=Promise.resolve();
 const campaignTimers=new Map();
 const posTimers=new Map();
@@ -108,7 +109,11 @@ async function schedulePosJob(job){
  posTimers.set(job.id,setTimeout(()=>runPosJob(job.id).catch(e=>logger.error({err:e,posJob:job.id},"POS job")),wait))
 }
 async function resumePosJobs(){for(const job of await loadPosQueue())if(!["sent","cancelled"].includes(job.status))await schedulePosJob(job)}
-function emitStatus(v){status=v;io.emit("whatsapp-status",{status:v})}
+function emitStatus(v){
+ if(v==="loading"&&status!=="loading")loadingSince=Date.now();
+ if(v!=="loading")loadingSince=null;
+ status=v;io.emit("whatsapp-status",{status:v});
+}
 function phone(v){let d=String(v||"").replace(/\D/g,"");if(!d)return"";if(d.startsWith("57")&&d.length===12)return d;if(d.length===10)return"57"+d;return d}
 function render(t,vars){let out=String(t||"");for(const[k,v]of Object.entries(vars||{})){out=out.split(`{{${k}}}`).join(String(v??""));out=out.split(`{{ ${k} }}`).join(String(v??""))}return out}
 
@@ -117,6 +122,7 @@ async function profileHasData(){
 }
 
 async function closeBrowser(reason="close"){
+ connectGeneration++;
  clearInterval(monitorTimer);monitorTimer=null;
  try{await context?.close()}catch(e){logger.warn({err:e?.message||String(e),reason},"Browser close warning")}
  context=null;page=null;connecting=false;latestQr=null;
@@ -124,8 +130,24 @@ async function closeBrowser(reason="close"){
 
 async function clearProfile(){
  await closeBrowser("clear-profile");
- await fs.rm(PROFILE_DIR,{recursive:true,force:true});
+ for(let attempt=0;;attempt++){
+  try{await fs.rm(PROFILE_DIR,{recursive:true,force:true});break}
+  catch(e){
+   if(attempt>=3)throw e;
+   await new Promise(r=>setTimeout(r,500));
+  }
+ }
  await ensure();
+}
+
+async function logDiagnosticSnapshot(reason){
+ if(!page||page.isClosed())return;
+ try{
+  const url=page.url();
+  const title=await page.title().catch(()=>null);
+  const bodyText=(await page.locator("body").innerText().catch(()=>""))?.slice(0,800);
+  logger.error({reason,url,title,bodyText},"WhatsApp connection appears stuck");
+ }catch(e){logger.warn({err:e?.message||String(e)},"diagnostic snapshot failed")}
 }
 
 async function findQrLocator() {
@@ -216,6 +238,7 @@ async function refreshState(){
    bodyText.includes("Vincular con el número de teléfono")||
    bodyText.includes("Iniciar sesión con número de teléfono")||
    bodyText.includes("Scan QR code")||
+   bodyText.includes("Scan to log in")||
    bodyText.includes("Link with phone number");
 
   // 1) Pantalla de login: si el teléfono desvinculó la sesión, este camino
@@ -245,15 +268,15 @@ async function refreshState(){
     }
     return;
    }
-
+   // Sin data-ref todavía (WhatsApp puede tardar en montarlo, o cambió el DOM):
+   // no nos quedemos atascados en "loading" — cae al fallback visual (paso 3)
+   // en vez de retornar aquí.
    latestQr=null;
    connecting=false;
-   if(status!=="loading")emitStatus("loading");
-   return;
   }
 
   // 2) Interfaz autenticada.
-  if(await isConnectedUi()){
+  if(!loginScreen&&await isConnectedUi()){
    latestQr=null;
    connecting=false;
    lastDisconnectInfo=null;
@@ -327,10 +350,11 @@ async function startWA(force=false){
   await refreshState();
   return;
  }
+ if(force||context)await closeBrowser("restart");
  connecting=true;latestQr=null;emitStatus("loading");
+ const myGen=++connectGeneration;
  try{
   await ensure();
-  if(force||context)await closeBrowser("restart");
 
   lastBrowserInfo={
    engine:"playwright-chromium",
@@ -339,7 +363,7 @@ async function startWA(force=false){
    startedAt:new Date().toISOString()
   };
 
-context = await chromium.launchPersistentContext(PROFILE_DIR, {
+const newContext = await chromium.launchPersistentContext(PROFILE_DIR, {
   headless: true,
   viewport: {
     width: 1365,
@@ -347,6 +371,9 @@ context = await chromium.launchPersistentContext(PROFILE_DIR, {
   },
   locale: "es-CO",
   timezoneId: "America/Bogota",
+  extraHTTPHeaders: {
+    "Accept-Language": "es-CO,es;q=0.9"
+  },
 
   userAgent:
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
@@ -361,9 +388,17 @@ context = await chromium.launchPersistentContext(PROFILE_DIR, {
     "--no-default-browser-check"
   ]
 });
+
+  if(myGen!==connectGeneration){
+   // A disconnect/newer connect happened while Chromium was still launching; discard this one.
+   await newContext.close().catch(()=>{});
+   return;
+  }
+  context=newContext;
   page=context.pages()[0]||await context.newPage();
 
   page.on("close",()=>{
+   if(myGen!==connectGeneration)return;
    logger.warn("WhatsApp page closed");
    latestQr=null;connecting=false;
    if(status!=="disconnected"){
@@ -373,6 +408,7 @@ context = await chromium.launchPersistentContext(PROFILE_DIR, {
   });
 
   page.on("crash",async()=>{
+   if(myGen!==connectGeneration)return;
    logger.error("WhatsApp Chromium page crashed");
    latestQr=null;connecting=false;
    lastDisconnectInfo={message:"Chromium page crashed",at:new Date().toISOString()};
@@ -386,6 +422,7 @@ context = await chromium.launchPersistentContext(PROFILE_DIR, {
   });
 
   context.on("close",()=>{
+   if(myGen!==connectGeneration)return;
    if(status==="connected"||status==="qr_ready"||status==="loading"){
     lastDisconnectInfo={message:"Chromium context closed",at:new Date().toISOString()};
     emitStatus("disconnected");
@@ -395,12 +432,21 @@ context = await chromium.launchPersistentContext(PROFILE_DIR, {
 
   await page.goto("https://web.whatsapp.com/",{waitUntil:"domcontentloaded",timeout:120000});
   await page.waitForTimeout(2500);
+  if(myGen!==connectGeneration)return;
   connecting=false;
   await refreshState();
 
   clearInterval(monitorTimer);
-  monitorTimer=setInterval(()=>refreshState().catch(()=>{}),5000);
+  monitorTimer=setInterval(()=>{
+   if(myGen!==connectGeneration)return;
+   refreshState().catch(()=>{});
+   if(status==="loading"&&loadingSince&&Date.now()-loadingSince>90000){
+    loadingSince=Date.now();
+    logDiagnosticSnapshot("stuck-loading").catch(()=>{});
+   }
+  },5000);
  }catch(e){
+  if(myGen!==connectGeneration)return;
   connecting=false;
   lastDisconnectInfo={message:e?.message||String(e),at:new Date().toISOString()};
   logger.error({err:e},"Failed to start Chromium WhatsApp Web");
