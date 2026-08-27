@@ -2,15 +2,15 @@ import express from "express";
 import cors from "cors";
 import http from "http";
 import {Server as SocketIOServer} from "socket.io";
-import QRCode from "qrcode";
 import pino from "pino";
 import fs from "fs/promises";
 import path from "path";
-import {makeWASocket,useMultiFileAuthState,fetchLatestBaileysVersion,DisconnectReason,Browsers} from "@whiskeysockets/baileys";
+import os from "os";
+import {chromium} from "playwright";
 
 const PORT=Number(process.env.PORT||3000);
 const DATA_DIR=process.env.DATA_DIR||"/data";
-const AUTH_DIR=path.join(DATA_DIR,"auth");
+const PROFILE_DIR=path.join(DATA_DIR,"whatsapp-profile");
 const CONFIG_FILE=path.join(DATA_DIR,"templates.json");
 const CAMPAIGNS_FILE=path.join(DATA_DIR,"campaigns.json");
 const POS_QUEUE_FILE=path.join(DATA_DIR,"pos-message-queue.json");
@@ -70,18 +70,20 @@ _Xiaomi Cartagena — Cl. 31 #61-64, Los Ángeles_`,
  ownerPhone:"3147729229"
 };
 
+
 const app=express();
 const server=http.createServer(app);
 const io=new SocketIOServer(server,{cors:{origin:ORIGINS}});
 app.use(cors({origin:(origin,cb)=>!origin||ORIGINS.includes(origin)?cb(null,true):cb(new Error("CORS"))}));
 app.use(express.json({limit:"8mb"}));
 
-let sock=null,status="disconnected",latestQr=null,connecting=false,reconnectTimer=null;
-let socketGeneration=0,lastDisconnectInfo=null,lastWaWebVersion=null,lastPairingAt=null;
+let context=null,page=null,status="disconnected",latestQr=null,connecting=false;
+let monitorTimer=null,lastPairingAt=null,lastDisconnectInfo=null,lastBrowserInfo=null;
+let sendChain=Promise.resolve();
 const campaignTimers=new Map();
 const posTimers=new Map();
 
-const ensure=()=>fs.mkdir(AUTH_DIR,{recursive:true});
+const ensure=()=>fs.mkdir(PROFILE_DIR,{recursive:true});
 async function readJson(file,fallback){try{return JSON.parse(await fs.readFile(file,"utf8"))}catch{return fallback}}
 async function writeJson(file,value){await fs.mkdir(DATA_DIR,{recursive:true});await fs.writeFile(file,JSON.stringify(value,null,2),"utf8")}
 async function loadCfg(){const cfg=await readJson(CONFIG_FILE,null);if(cfg)return{...defaults,...cfg};await saveCfg(defaults);return{...defaults}}
@@ -108,188 +110,227 @@ async function resumePosJobs(){for(const job of await loadPosQueue())if(!["sent"
 function emitStatus(v){status=v;io.emit("whatsapp-status",{status:v})}
 function phone(v){let d=String(v||"").replace(/\D/g,"");if(!d)return"";if(d.startsWith("57")&&d.length===12)return d;if(d.length===10)return"57"+d;return d}
 function render(t,vars){let out=String(t||"");for(const[k,v]of Object.entries(vars||{})){out=out.split(`{{${k}}}`).join(String(v??""));out=out.split(`{{ ${k} }}`).join(String(v??""))}return out}
-async function clearAuth(){await fs.rm(AUTH_DIR,{recursive:true,force:true});await ensure()}
 
-async function fetchLiveWaWebVersion(){
- try{
-  const response=await fetch("https://web.whatsapp.com/sw.js",{
-   headers:{
-    "sec-fetch-site":"none",
-    "user-agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-   }
-  });
-  if(!response.ok)throw new Error(`sw.js HTTP ${response.status}`);
-  const body=await response.text();
-  const match=body.match(/\\"?client_revision\\"?\s*:\s*(\d+)/);
-  if(!match?.[1])throw new Error("client_revision no encontrado");
-  const version=[2,3000,Number(match[1])];
-  lastWaWebVersion={source:"web.whatsapp.com",version,at:new Date().toISOString()};
-  return version;
- }catch(err){
-  logger.warn({err:err?.message||String(err)},"No se pudo obtener WA Web live version; usando fallback Baileys");
-  const fallback=await fetchLatestBaileysVersion();
-  lastWaWebVersion={source:"baileys-fallback",version:fallback.version,at:new Date().toISOString(),error:err?.message||String(err)};
-  return fallback.version;
+async function profileHasData(){
+ try{const files=await fs.readdir(PROFILE_DIR);return files.length>0}catch{return false}
+}
+
+async function closeBrowser(reason="close"){
+ clearInterval(monitorTimer);monitorTimer=null;
+ try{await context?.close()}catch(e){logger.warn({err:e?.message||String(e),reason},"Browser close warning")}
+ context=null;page=null;connecting=false;latestQr=null;
+}
+
+async function clearProfile(){
+ await closeBrowser("clear-profile");
+ await fs.rm(PROFILE_DIR,{recursive:true,force:true});
+ await ensure();
+}
+
+async function findQrLocator(){
+ if(!page||page.isClosed())return null;
+ const canvases=page.locator("canvas");
+ const count=await canvases.count().catch(()=>0);
+ for(let i=0;i<count;i++){
+  const loc=canvases.nth(i);
+  const box=await loc.boundingBox().catch(()=>null);
+  if(box&&box.width>=180&&box.height>=180&&Math.abs(box.width-box.height)<80)return loc;
  }
+ const refs=page.locator('div[data-ref]');
+ const rc=await refs.count().catch(()=>0);
+ for(let i=0;i<rc;i++){
+  const loc=refs.nth(i);
+  const box=await loc.boundingBox().catch(()=>null);
+  if(box&&box.width>=180&&box.height>=180)return loc;
+ }
+ return null;
 }
 
-function disconnectCode(error){
- return error?.output?.statusCode||error?.data?.statusCode||error?.statusCode||null;
+async function isConnectedUi(){
+ if(!page||page.isClosed())return false;
+ if(await page.locator("#pane-side").count().catch(()=>0))return true;
+ const selectors=[
+  '[data-testid="chat-list"]',
+  'div[aria-label*="Chat list"]',
+  'div[aria-label*="Lista de chats"]'
+ ];
+ for(const sel of selectors)if(await page.locator(sel).count().catch(()=>0))return true;
+ return false;
 }
 
-function safeEndSocket(reason="replace"){
- if(!sock)return;
- try{sock.ev?.removeAllListeners?.("connection.update")}catch{}
- try{sock.end(new Error(reason))}catch{}
- sock=null;
-}
-async function startWA(force=false){
- if(connecting&&!force)return;
- const generation=++socketGeneration;
- connecting=true;
- latestQr=null;
- emitStatus("loading");
-
+async function refreshState(){
+ if(!page||page.isClosed())return;
  try{
-  await ensure();
-
-  if(force){
-   clearTimeout(reconnectTimer);
-   reconnectTimer=null;
-   safeEndSocket("forced reconnect");
-  }else if(sock){
-   safeEndSocket("new connection");
-  }
-
-  const {state,saveCreds}=await useMultiFileAuthState(AUTH_DIR);
-  const version=await fetchLiveWaWebVersion();
-
-  logger.info({
-   generation,
-   version:version.join("."),
-   registered:Boolean(state.creds?.registered)
-  },"Starting WhatsApp Business compatible socket");
-
-  const localSock=makeWASocket({
-   version,
-   auth:state,
-   logger,
-   browser:Browsers.macOS("Chrome"),
-   printQRInTerminal:false,
-   markOnlineOnConnect:false,
-   syncFullHistory:false,
-   generateHighQualityLinkPreview:false,
-   connectTimeoutMs:120000,
-   keepAliveIntervalMs:10000,
-   qrTimeout:180000,
-   defaultQueryTimeoutMs:undefined,
-   shouldSyncHistoryMessage:()=>false,
-   getMessage:async()=>undefined
-  });
-
-  sock=localSock;
-  localSock.ev.on("creds.update",saveCreds);
-
-  localSock.ev.on("connection.update",async update=>{
-   if(generation!==socketGeneration)return;
-
-   const {connection,lastDisconnect,qr}=update;
-
-   if(qr){
-    lastPairingAt=new Date().toISOString();
-    latestQr=await QRCode.toDataURL(qr,{margin:1,width:320});
-    connecting=false;
-    emitStatus("qr_ready");
-    io.emit("whatsapp-qr",{qr:latestQr});
-    logger.info({generation,version:version.join(".")},"Fresh WhatsApp QR generated");
-   }
-
-   if(connection==="open"){
-    latestQr=null;
-    connecting=false;
-    lastDisconnectInfo=null;
-    emitStatus("connected");
-    logger.info({
-     generation,
-     version:version.join("."),
-     registered:Boolean(state.creds?.registered),
-     user:localSock.user?.id||null
-    },"WhatsApp Business linked successfully");
+  if(await isConnectedUi()){
+   if(status!=="connected"){
+    latestQr=null;connecting=false;lastDisconnectInfo=null;emitStatus("connected");
+    logger.info("WhatsApp Web connected in Chromium");
     resumeScheduledCampaigns().catch(e=>logger.error({err:e},"resume campaigns"));
     resumePosJobs().catch(e=>logger.error({err:e},"resume POS messages"));
    }
+   return;
+  }
 
-   if(connection==="close"){
-    connecting=false;
-    const err=lastDisconnect?.error;
-    const code=disconnectCode(err);
-    const message=err?.message||String(err||"");
-    const registered=Boolean(state.creds?.registered);
-
-    lastDisconnectInfo={
-     code,message,registered,
-     at:new Date().toISOString(),
-     version:version.join(".")
-    };
-
-    logger.warn(lastDisconnectInfo,"WhatsApp connection closed");
-
-    // 401 means WhatsApp invalidated/removed this companion.
-    if(code===DisconnectReason.loggedOut||code===401){
-     latestQr=null;
-     emitStatus("disconnected");
-     safeEndSocket("logged out/device removed");
-     await clearAuth();
-     logger.warn("Auth cleared after 401/device_removed. Generate a fresh QR.");
-     return;
-    }
-
-    // 515 = restart required after pairing or protocol transition.
-    if(code===515){
-     emitStatus("loading");
-     clearTimeout(reconnectTimer);
-     reconnectTimer=setTimeout(()=>startWA(true).catch(e=>logger.error({err:e},"restartRequired reconnect")),1500);
-     return;
-    }
-
-    // 408/428 can happen during initial sync. Avoid aggressive reconnect loops.
-    if(code===408||code===428){
-     emitStatus("loading");
-     clearTimeout(reconnectTimer);
-     reconnectTimer=setTimeout(()=>startWA(true).catch(e=>logger.error({err:e},"delayed reconnect")),8000);
-     return;
-    }
-
-    emitStatus("loading");
-    clearTimeout(reconnectTimer);
-    reconnectTimer=setTimeout(()=>startWA(true).catch(e=>logger.error({err:e},"generic reconnect")),5000);
+  const qr=await findQrLocator();
+  if(qr){
+   const buf=await qr.screenshot({type:"png"});
+   const next=`data:image/png;base64,${buf.toString("base64")}`;
+   const changed=next!==latestQr;
+   latestQr=next;connecting=false;
+   if(status!=="qr_ready"||changed){
+    lastPairingAt=new Date().toISOString();
+    emitStatus("qr_ready");
+    io.emit("whatsapp-qr",{qr:latestQr});
+    logger.info("WhatsApp Web QR ready");
    }
+   return;
+  }
+
+  if(status!=="loading")emitStatus("loading");
+ }catch(e){
+  logger.warn({err:e?.message||String(e)},"refreshState failed");
+ }
+}
+
+async function startWA(force=false){
+ if(connecting&&!force)return;
+ if(context&&!force){
+  await refreshState();
+  return;
+ }
+ connecting=true;latestQr=null;emitStatus("loading");
+ try{
+  await ensure();
+  if(force||context)await closeBrowser("restart");
+
+  lastBrowserInfo={
+   engine:"playwright-chromium",
+   headless:true,
+   profileDir:PROFILE_DIR,
+   startedAt:new Date().toISOString()
+  };
+
+  context=await chromium.launchPersistentContext(PROFILE_DIR,{
+   headless:true,
+   viewport:{width:1365,height:900},
+   locale:"es-CO",
+   timezoneId:"America/Bogota",
+   args:["--no-sandbox","--disable-dev-shm-usage","--disable-gpu","--no-first-run","--no-default-browser-check"]
   });
 
+  page=context.pages()[0]||await context.newPage();
+  page.on("close",()=>logger.warn("WhatsApp page closed"));
+  context.on("close",()=>{
+   if(status==="connected"||status==="qr_ready"||status==="loading"){
+    lastDisconnectInfo={message:"Chromium context closed",at:new Date().toISOString()};
+    emitStatus("disconnected");
+   }
+   context=null;page=null;connecting=false;latestQr=null;
+  });
+
+  await page.goto("https://web.whatsapp.com/",{waitUntil:"domcontentloaded",timeout:120000});
+  await page.waitForTimeout(2500);
+  connecting=false;
+  await refreshState();
+
+  clearInterval(monitorTimer);
+  monitorTimer=setInterval(()=>refreshState().catch(()=>{}),2500);
  }catch(e){
   connecting=false;
-  lastDisconnectInfo={code:null,message:e?.message||String(e),registered:null,at:new Date().toISOString(),version:lastWaWebVersion?.version?.join?.(".")||null};
-  logger.error({err:e},"startWA failed");
+  lastDisconnectInfo={message:e?.message||String(e),at:new Date().toISOString()};
+  logger.error({err:e},"Failed to start Chromium WhatsApp Web");
+  await closeBrowser("start-failed");
   emitStatus("disconnected");
  }
 }
-async function sendText(to,text){
- if(!sock||status!=="connected")throw new Error("WhatsApp no está conectado");
- const p=phone(to);if(!p)throw new Error("Número inválido");
- await sock.sendMessage(`${p}@s.whatsapp.net`,{text});return p;
-}
-async function sendImageOrText(to,message,imageUrl){
- const p=phone(to); if(!p)throw new Error("Número inválido");
- if(!sock||status!=="connected")throw new Error("WhatsApp no está conectado");
- const jid=`${p}@s.whatsapp.net`;
- if(imageUrl){
-  if(imageUrl.startsWith("data:image/")){
-   const m=imageUrl.match(/^data:(image\/[^;]+);base64,(.+)$/);
-   if(m){await sock.sendMessage(jid,{image:Buffer.from(m[2],"base64"),mimetype:m[1],caption:message});return p}
-  }
-  if(/^https?:\/\//i.test(imageUrl)){await sock.sendMessage(jid,{image:{url:imageUrl},caption:message});return p}
+
+async function composerLocator(){
+ const candidates=[
+  '#main footer div[contenteditable="true"][role="textbox"]',
+  '#main div[contenteditable="true"][role="textbox"]'
+ ];
+ for(const sel of candidates){
+  const loc=page.locator(sel).last();
+  if(await loc.count().catch(()=>0))return loc;
  }
- await sock.sendMessage(jid,{text:message});return p;
+ throw new Error("No se encontró el cuadro de mensaje de WhatsApp Web");
+}
+
+async function navigateToChat(to,text=""){
+ if(status!=="connected"||!page||page.isClosed())throw new Error("WhatsApp no está conectado");
+ const p=phone(to);if(!p)throw new Error("Número inválido");
+ const url=`https://web.whatsapp.com/send?phone=${encodeURIComponent(p)}${text?`&text=${encodeURIComponent(text)}`:""}`;
+ await page.goto(url,{waitUntil:"domcontentloaded",timeout:90000});
+ await page.waitForSelector("#main",{timeout:45000});
+ return p;
+}
+
+async function doSendText(to,text){
+ const p=await navigateToChat(to,text);
+ const composer=await composerLocator();
+ await composer.waitFor({state:"visible",timeout:30000});
+ await page.waitForTimeout(500);
+ await composer.press("Enter");
+ await page.waitForTimeout(1200);
+ return p;
+}
+
+async function tempImageFrom(imageUrl){
+ const ext=".jpg",file=path.join(os.tmpdir(),`wa-${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`);
+ if(imageUrl.startsWith("data:image/")){
+  const m=imageUrl.match(/^data:(image\/[^;]+);base64,(.+)$/);
+  if(!m)throw new Error("Imagen base64 inválida");
+  await fs.writeFile(file,Buffer.from(m[2],"base64"));return file;
+ }
+ if(/^https?:\/\//i.test(imageUrl)){
+  const r=await fetch(imageUrl);if(!r.ok)throw new Error(`No se pudo descargar imagen (${r.status})`);
+  await fs.writeFile(file,Buffer.from(await r.arrayBuffer()));return file;
+ }
+ throw new Error("Formato de imagen no soportado");
+}
+
+async function doSendImage(to,message,imageUrl){
+ const p=await navigateToChat(to,"");
+ const file=await tempImageFrom(imageUrl);
+ try{
+  let input=page.locator('input[type="file"][accept*="image"]').first();
+  if(!(await input.count().catch(()=>0))){
+   const attach=page.locator('button[aria-label*="Attach"],button[aria-label*="Adjuntar"],button[title*="Attach"],button[title*="Adjuntar"]').first();
+   if(await attach.count().catch(()=>0))await attach.click();
+   await page.waitForTimeout(500);
+   input=page.locator('input[type="file"]').first();
+  }
+  if(!(await input.count().catch(()=>0)))throw new Error("No se encontró selector de adjuntos");
+  await input.setInputFiles(file);
+  await page.waitForTimeout(1200);
+
+  if(message){
+   const caption=page.locator('div[contenteditable="true"][role="textbox"]').last();
+   if(await caption.count().catch(()=>0))await caption.fill(message).catch(async()=>{await caption.click();await page.keyboard.type(message)});
+  }
+
+  const sendBtn=page.locator('button[aria-label="Send"],button[aria-label="Enviar"],[data-testid="compose-btn-send"]').last();
+  if(await sendBtn.count().catch(()=>0))await sendBtn.click();
+  else await page.keyboard.press("Enter");
+  await page.waitForTimeout(1500);
+  return p;
+ }finally{await fs.rm(file,{force:true}).catch(()=>{})}
+}
+
+async function sendText(to,text){
+ const task=()=>doSendText(to,text);
+ sendChain=sendChain.then(task,task);
+ return sendChain;
+}
+
+async function sendImageOrText(to,message,imageUrl){
+ if(!imageUrl)return sendText(to,message);
+ const task=()=>doSendImage(to,message,imageUrl).catch(async e=>{
+  logger.warn({err:e?.message||String(e)},"Image send failed; falling back to text");
+  return doSendText(to,message);
+ });
+ sendChain=sendChain.then(task,task);
+ return sendChain;
 }
 
 async function fetchCustomers(){
@@ -364,35 +405,31 @@ async function scheduleCampaign(c){
 }
 async function resumeScheduledCampaigns(){for(const c of await loadCampaigns())if(["scheduled","active","processing"].includes(c.status))await scheduleCampaign(c)}
 
-app.get("/health",(req,res)=>res.json({ok:true,service:"xiaomi-whatsapp-service",status}));
+
+app.get("/health",(req,res)=>res.json({ok:true,service:"xiaomi-whatsapp-service",engine:"playwright-chromium",status}));
 app.get("/api/whatsapp/status",(req,res)=>res.json({status,qr:latestQr}));
 app.get("/api/whatsapp/diagnostics",(req,res)=>res.json({
  status,
  connecting,
  hasQr:Boolean(latestQr),
  lastPairingAt,
- lastWaWebVersion,
+ lastBrowserInfo,
  lastDisconnect:lastDisconnectInfo,
- authDir:AUTH_DIR,
+ profileDir:PROFILE_DIR,
  dataDir:DATA_DIR
 }));
-app.post("/api/whatsapp/connect",(req,res)=>{startWA(Boolean(req.body?.force)).catch(()=>{});res.json({success:true,status,qr:latestQr})});
-app.post("/api/whatsapp/disconnect",async(req,res)=>{clearTimeout(reconnectTimer);reconnectTimer=null;try{if(sock){try{await sock.logout()}catch{}try{sock.end(new Error("manual"))}catch{}}}finally{sock=null;latestQr=null;connecting=false;await clearAuth();emitStatus("disconnected")}res.json({success:true,status})});
-
-app.post("/api/whatsapp/reset-session",async(req,res)=>{try{
- clearTimeout(reconnectTimer);reconnectTimer=null;
- socketGeneration++;
- safeEndSocket("reset-session");
- connecting=false;latestQr=null;
- await clearAuth();
- emitStatus("disconnected");
- lastDisconnectInfo=null;lastPairingAt=null;
- logger.info({authDir:AUTH_DIR},"WhatsApp auth session reset");
- res.json({success:true,message:"Sesión de WhatsApp eliminada. Ya puedes generar un QR nuevo.",status});
-}catch(error){
- logger.error({err:error},"reset-session failed");
- res.status(500).json({success:false,error:error.message});
-}});
+app.post("/api/whatsapp/connect",(req,res)=>{
+ startWA(Boolean(req.body?.force)).catch(e=>logger.error({err:e},"connect endpoint"));
+ res.json({success:true,status,qr:latestQr});
+});
+app.post("/api/whatsapp/disconnect",async(req,res)=>{
+ try{await clearProfile();emitStatus("disconnected");lastDisconnectInfo=null;lastPairingAt=null;res.json({success:true,status})}
+ catch(e){res.status(500).json({success:false,error:e.message})}
+});
+app.post("/api/whatsapp/reset-session",async(req,res)=>{
+ try{await clearProfile();emitStatus("disconnected");lastDisconnectInfo=null;lastPairingAt=null;logger.info({profileDir:PROFILE_DIR},"WhatsApp Chromium profile reset");res.json({success:true,message:"Sesión de WhatsApp eliminada. Ya puedes generar un QR nuevo.",status})}
+ catch(error){logger.error({err:error},"reset-session failed");res.status(500).json({success:false,error:error.message})}
+});
 
 app.get("/api/whatsapp/templates",async(req,res)=>res.json(await loadCfg()));
 app.put("/api/whatsapp/templates",async(req,res)=>{const next={...(await loadCfg()),...req.body};await saveCfg(next);res.json({success:true,...next})});
@@ -454,5 +491,13 @@ app.post("/api/whatsapp/campaigns/:id/status",async(req,res)=>{try{
 }catch(e){res.status(500).json({error:e.message})}});
 app.delete("/api/whatsapp/campaigns/:id",async(req,res)=>{const all=await loadCampaigns(),next=all.filter(c=>c.id!==req.params.id);if(next.length===all.length)return res.status(404).json({error:"Campaña no encontrada"});if(campaignTimers.has(req.params.id)){clearTimeout(campaignTimers.get(req.params.id));campaignTimers.delete(req.params.id)}await saveCampaigns(next);res.json({success:true})});
 
-io.on("connection",s=>{s.emit("whatsapp-status",{status});if(latestQr)s.emit("whatsapp-qr",{qr:latestQr})});
-server.listen(PORT,"0.0.0.0",async()=>{await ensure();logger.info({PORT,ORIGINS,OLD_BACKEND_URL},"server started");await resumeScheduledCampaigns();await resumePosJobs();if(process.env.AUTO_CONNECT==="true")startWA().catch(()=>{})});
+
+io.on("connection",socket=>{socket.emit("whatsapp-status",{status});if(latestQr)socket.emit("whatsapp-qr",{qr:latestQr})});
+server.listen(PORT,"0.0.0.0",async()=>{
+ await ensure();
+ logger.info({PORT,ORIGINS,OLD_BACKEND_URL,PROFILE_DIR},"server started with Playwright Chromium");
+ await resumeScheduledCampaigns();
+ await resumePosJobs();
+ const hasProfile=await profileHasData();
+ if(hasProfile||process.env.AUTO_CONNECT==="true")startWA().catch(e=>logger.error({err:e},"startup WhatsApp"));
+});

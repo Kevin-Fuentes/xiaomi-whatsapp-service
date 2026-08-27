@@ -11,11 +11,10 @@
     "dev": "node --watch src/server.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "6.7.24",
     "cors": "^2.8.5",
     "express": "^4.21.2",
     "pino": "^9.6.0",
-    "qrcode": "^1.5.4",
-    "socket.io": "^4.8.1"
+    "socket.io": "^4.8.1",
+    "playwright": "1.55.0"
   }
 }
