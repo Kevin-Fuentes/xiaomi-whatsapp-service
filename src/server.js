@@ -226,6 +226,46 @@ app.get("/health",(req,res)=>res.json({ok:true,service:"xiaomi-whatsapp-service"
 app.get("/api/whatsapp/status",(req,res)=>res.json({status,qr:latestQr}));
 app.post("/api/whatsapp/connect",(req,res)=>{startWA(Boolean(req.body?.force)).catch(()=>{});res.json({success:true,status,qr:latestQr})});
 app.post("/api/whatsapp/disconnect",async(req,res)=>{clearTimeout(reconnectTimer);reconnectTimer=null;try{if(sock){try{await sock.logout()}catch{}try{sock.end(new Error("manual"))}catch{}}}finally{sock=null;latestQr=null;connecting=false;await clearAuth();emitStatus("disconnected")}res.json({success:true,status})});
+app.post("/api/whatsapp/reset-session", async (req, res) => {
+  try {
+    const authPath = path.join(DATA_DIR, "auth");
+
+    // Cerrar la conexión actual antes de borrar credenciales
+    try {
+      if (sock) {
+        sock.end(undefined);
+        sock = null;
+      }
+    } catch (e) {
+      console.warn("Error cerrando socket:", e.message);
+    }
+
+    // Borrar SOLO la sesión de WhatsApp
+    await fs.rm(authPath, {
+      recursive: true,
+      force: true
+    });
+
+    // Reiniciar estado
+    status = "disconnected";
+    qrData = null;
+
+    console.log("WhatsApp auth session deleted:", authPath);
+
+    res.json({
+      success: true,
+      message: "Sesión de WhatsApp eliminada",
+      path: authPath
+    });
+  } catch (error) {
+    console.error("Error resetting WhatsApp session:", error);
+
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
 
 app.get("/api/whatsapp/templates",async(req,res)=>res.json(await loadCfg()));
 app.put("/api/whatsapp/templates",async(req,res)=>{const next={...(await loadCfg()),...req.body};await saveCfg(next);res.json({success:true,...next})});
