@@ -19,8 +19,6 @@ const POS_DELAY_MS=Number(process.env.POS_MESSAGE_DELAY_MS||600000);
 const OLD_BACKEND_URL=process.env.OLD_BACKEND_URL||"https://xiaomictg-backend-production.up.railway.app";
 const ORIGINS=(process.env.ALLOWED_ORIGINS||"https://xiaomicartagena.com,https://www.xiaomicartagena.com").split(",").map(x=>x.trim()).filter(Boolean);
 const logger=pino({level:process.env.LOG_LEVEL||"info"});
-let lastSessionValidationAt = 0;
-const SESSION_VALIDATION_MS = 20000;
 
 const defaults={
  customerTemplate:`🎉 *¡Pedido Confirmado!* — Xiaomi Cartagena
@@ -185,153 +183,143 @@ async function findQrLocator() {
   return null;
 }
 
-async function isConnectedUi() {
-  if (!page || page.isClosed()) return false;
-
-  const selectors = [
-    "#pane-side",
-    "#main",
-    '[data-testid="chat-list"]',
-    'div[aria-label*="Chat list"]',
-    'div[aria-label*="Lista de chats"]',
-    '[role="grid"]'
-  ];
-
-  for (const sel of selectors) {
-    const count = await page.locator(sel).count().catch(() => 0);
-
-    if (count > 0) {
-      return true;
-    }
-  }
-
-  return false;
+async function isConnectedUi(){
+ if(!page||page.isClosed())return false;
+ const selectors=[
+  "#pane-side",
+  '[data-testid="chat-list"]',
+  'div[aria-label*="Chat list"]',
+  'div[aria-label*="Lista de chats"]',
+  '[role="grid"]'
+ ];
+ for(const sel of selectors){
+  const count=await page.locator(sel).count().catch(()=>0);
+  if(count>0)return true;
+ }
+ return false;
 }
-async function refreshState() {
-  if (!page || page.isClosed()) return;
-if (
-  status === "connected" &&
-  Date.now() - lastSessionValidationAt > SESSION_VALIDATION_MS
-) {
-  lastSessionValidationAt = Date.now();
+async function refreshState(){
+ if(!page||page.isClosed()){
+  if(status==="connected"||status==="qr_ready"||status==="loading"){
+   latestQr=null;connecting=false;
+   lastDisconnectInfo={message:"Chromium page is not alive",at:new Date().toISOString()};
+   emitStatus("disconnected");
+  }
+  return;
+ }
 
-  try {
-    logger.info("Validando sesión de WhatsApp Web...");
+ try{
+  const bodyText=await page.locator("body").innerText().catch(()=>"");
+  const loginScreen=
+   bodyText.includes("Escanea para iniciar sesión")||
+   bodyText.includes("Escanea el código QR")||
+   bodyText.includes("Vincular con el número de teléfono")||
+   bodyText.includes("Iniciar sesión con número de teléfono")||
+   bodyText.includes("Scan QR code")||
+   bodyText.includes("Link with phone number");
 
-    await page.reload({
-      waitUntil: "domcontentloaded",
-      timeout: 60000
+  // 1) Pantalla de login: si el teléfono desvinculó la sesión, este camino
+  // vuelve a publicar QR sin necesidad de reset manual.
+  if(loginScreen){
+   const qrRef=await page.locator("[data-ref]").first().getAttribute("data-ref").catch(()=>null);
+
+   if(qrRef&&qrRef.length>50){
+    const next=await QRCode.toDataURL(qrRef,{
+     width:420,
+     margin:4,
+     errorCorrectionLevel:"M"
     });
 
-    await page.waitForTimeout(2500);
-  } catch (e) {
-    logger.warn(
-      { err: e?.message || String(e) },
-      "Error validando sesión de WhatsApp"
-    );
+    const changed=next!==latestQr;
+    latestQr=next;
+    connecting=false;
+
+    if(status!=="qr_ready"||changed){
+     lastPairingAt=new Date().toISOString();
+     lastDisconnectInfo=status==="connected"
+      ?{message:"WhatsApp was remotely unlinked",at:new Date().toISOString()}
+      :lastDisconnectInfo;
+     emitStatus("qr_ready");
+     io.emit("whatsapp-qr",{qr:latestQr});
+     logger.info("WhatsApp QR generated directly from data-ref");
+    }
+    return;
+   }
+
+   latestQr=null;
+   connecting=false;
+   if(status!=="loading")emitStatus("loading");
+   return;
   }
-}
-  try {
-    const bodyText = await page.locator("body")
-      .innerText()
-      .catch(() => "");
 
-    // 1. Detectar que WhatsApp volvió a pedir inicio de sesión.
-    // Esto ocurre también cuando desvinculas el dispositivo desde el celular.
-    const loginScreen =
-      bodyText.includes("Escanea para iniciar sesión") ||
-      bodyText.includes("Escanea el código QR") ||
-      bodyText.includes("Vincular con el número de teléfono") ||
-      bodyText.includes("Iniciar sesión con número de teléfono") ||
-      bodyText.includes("Scan QR code") ||
-      bodyText.includes("Link with phone number");
+  // 2) Interfaz autenticada.
+  if(await isConnectedUi()){
+   latestQr=null;
+   connecting=false;
+   lastDisconnectInfo=null;
 
-    if (loginScreen) {
-      if (status === "connected") {
-        logger.warn("WhatsApp fue desvinculado desde el teléfono");
-        latestQr = null;
-        connecting = false;
-      }
-
-      // Intentar extraer el QR ORIGINAL
-      const qrRef = await page
-        .locator("[data-ref]")
-        .first()
-        .getAttribute("data-ref")
-        .catch(() => null);
-
-      if (qrRef && qrRef.length > 50) {
-        const next = await QRCode.toDataURL(qrRef, {
-          width: 420,
-          margin: 4,
-          errorCorrectionLevel: "M"
-        });
-
-        const changed = next !== latestQr;
-
-        latestQr = next;
-        connecting = false;
-
-        if (status !== "qr_ready" || changed) {
-          lastPairingAt = new Date().toISOString();
-
-          emitStatus("qr_ready");
-
-          io.emit("whatsapp-qr", {
-            qr: latestQr
-          });
-
-          logger.info("WhatsApp desvinculado: nuevo QR generado");
-        }
-
-        return;
-      }
-
-      // Está en login, pero el QR todavía no apareció.
-      latestQr = null;
-
-      if (status !== "loading") {
-        emitStatus("loading");
-      }
-
-      return;
-    }
-
-    // 2. Si NO estamos en login, comprobar interfaz autenticada
-    if (await isConnectedUi()) {
-      latestQr = null;
-      connecting = false;
-      lastDisconnectInfo = null;
-
-      if (status !== "connected") {
-        emitStatus("connected");
-
-        logger.info("WhatsApp Web connected in Chromium");
-
-        resumeScheduledCampaigns().catch(e =>
-          logger.error({ err: e }, "resume campaigns")
-        );
-
-        resumePosJobs().catch(e =>
-          logger.error({ err: e }, "resume POS messages")
-        );
-      }
-
-      return;
-    }
-
-    // 3. Transición intermedia.
-    // Si estaba conectado, no declararlo desconectado por un cambio fugaz del DOM.
-    if (status !== "connected" && status !== "loading") {
-      emitStatus("loading");
-    }
-
-  } catch (e) {
-    logger.warn(
-      { err: e?.message || String(e) },
-      "refreshState failed"
-    );
+   if(status!=="connected"){
+    emitStatus("connected");
+    logger.info("WhatsApp Web connected in Chromium");
+    resumeScheduledCampaigns().catch(e=>logger.error({err:e},"resume campaigns"));
+    resumePosJobs().catch(e=>logger.error({err:e},"resume POS messages"));
+   }
+   return;
   }
+
+  // 3) Fallback visual del QR para cambios de DOM de WhatsApp.
+  const qr=await findQrLocator();
+  if(qr){
+   let next=null;
+
+   next=await qr.evaluate(el=>{
+    if(el instanceof HTMLCanvasElement)return el.toDataURL("image/png");
+    const canvas=el.querySelector?.("canvas");
+    return canvas instanceof HTMLCanvasElement?canvas.toDataURL("image/png"):null;
+   }).catch(()=>null);
+
+   if(!next){
+    next=await qr.evaluate(el=>{
+     let svg=null;
+     if(el instanceof SVGElement||el.tagName?.toLowerCase()==="svg")svg=el;
+     else svg=el.querySelector?.("svg");
+     if(!svg)return null;
+     const xml=new XMLSerializer().serializeToString(svg);
+     return "data:image/svg+xml;base64,"+btoa(unescape(encodeURIComponent(xml)));
+    }).catch(()=>null);
+   }
+
+   if(!next){
+    const buf=await qr.screenshot({type:"png",animations:"disabled"});
+    next=`data:image/png;base64,${buf.toString("base64")}`;
+   }
+
+   const changed=next!==latestQr;
+   latestQr=next;
+   connecting=false;
+
+   if(status!=="qr_ready"||changed){
+    lastPairingAt=new Date().toISOString();
+    emitStatus("qr_ready");
+    io.emit("whatsapp-qr",{qr:latestQr});
+    logger.info("WhatsApp Web QR ready through visual fallback");
+   }
+   return;
+  }
+
+  // 4) No degradar connected por un cambio fugaz del DOM.
+  if(status!=="connected"&&status!=="loading")emitStatus("loading");
+ }catch(e){
+  const message=e?.message||String(e);
+  logger.warn({err:message},"refreshState failed");
+
+  if(/Target crashed|Target page, context or browser has been closed|page\.title: Target crashed/i.test(message)){
+   latestQr=null;
+   connecting=false;
+   lastDisconnectInfo={message:"Chromium page crashed",detail:message,at:new Date().toISOString()};
+   emitStatus("disconnected");
+  }
+ }
 }
 async function startWA(force=false){
  if(connecting&&!force)return;
@@ -374,7 +362,29 @@ context = await chromium.launchPersistentContext(PROFILE_DIR, {
   ]
 });
   page=context.pages()[0]||await context.newPage();
-  page.on("close",()=>logger.warn("WhatsApp page closed"));
+
+  page.on("close",()=>{
+   logger.warn("WhatsApp page closed");
+   latestQr=null;connecting=false;
+   if(status!=="disconnected"){
+    lastDisconnectInfo={message:"Chromium page closed",at:new Date().toISOString()};
+    emitStatus("disconnected");
+   }
+  });
+
+  page.on("crash",async()=>{
+   logger.error("WhatsApp Chromium page crashed");
+   latestQr=null;connecting=false;
+   lastDisconnectInfo={message:"Chromium page crashed",at:new Date().toISOString()};
+   emitStatus("disconnected");
+
+   try{await closeBrowser("page-crashed")}catch{}
+
+   setTimeout(()=>{
+    startWA(true).catch(e=>logger.error({err:e},"Error restarting WhatsApp after page crash"));
+   },5000);
+  });
+
   context.on("close",()=>{
    if(status==="connected"||status==="qr_ready"||status==="loading"){
     lastDisconnectInfo={message:"Chromium context closed",at:new Date().toISOString()};
@@ -389,7 +399,7 @@ context = await chromium.launchPersistentContext(PROFILE_DIR, {
   await refreshState();
 
   clearInterval(monitorTimer);
-  monitorTimer=setInterval(()=>refreshState().catch(()=>{}),2500);
+  monitorTimer=setInterval(()=>refreshState().catch(()=>{}),5000);
  }catch(e){
   connecting=false;
   lastDisconnectInfo={message:e?.message||String(e),at:new Date().toISOString()};
@@ -562,11 +572,20 @@ async function resumeScheduledCampaigns(){for(const c of await loadCampaigns())i
 
 
 app.get("/health",(req,res)=>res.json({ok:true,service:"xiaomi-whatsapp-service",engine:"playwright-chromium",status}));
-app.get("/api/whatsapp/status",(req,res)=>res.json({status,qr:latestQr}));
+app.get("/api/whatsapp/status",(req,res)=>{
+ const pageAlive=Boolean(page&&!page.isClosed());
+ if(!pageAlive&&status==="connected"){
+  status="disconnected";
+  latestQr=null;
+  lastDisconnectInfo={message:"Chromium page is not alive",at:new Date().toISOString()};
+ }
+ res.json({status,qr:latestQr});
+});
 app.get("/api/whatsapp/diagnostics",(req,res)=>res.json({
  status,
  connecting,
  hasQr:Boolean(latestQr),
+ browserPageAlive:Boolean(page&&!page.isClosed()),
  lastPairingAt,
  lastBrowserInfo,
  lastDisconnect:lastDisconnectInfo,
