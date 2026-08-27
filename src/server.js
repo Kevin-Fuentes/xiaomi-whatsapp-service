@@ -19,6 +19,8 @@ const POS_DELAY_MS=Number(process.env.POS_MESSAGE_DELAY_MS||600000);
 const OLD_BACKEND_URL=process.env.OLD_BACKEND_URL||"https://xiaomictg-backend-production.up.railway.app";
 const ORIGINS=(process.env.ALLOWED_ORIGINS||"https://xiaomicartagena.com,https://www.xiaomicartagena.com").split(",").map(x=>x.trim()).filter(Boolean);
 const logger=pino({level:process.env.LOG_LEVEL||"info"});
+let lastSessionValidationAt = 0;
+const SESSION_VALIDATION_MS = 20000;
 
 const defaults={
  customerTemplate:`🎉 *¡Pedido Confirmado!* — Xiaomi Cartagena
@@ -207,7 +209,28 @@ async function isConnectedUi() {
 }
 async function refreshState() {
   if (!page || page.isClosed()) return;
+if (
+  status === "connected" &&
+  Date.now() - lastSessionValidationAt > SESSION_VALIDATION_MS
+) {
+  lastSessionValidationAt = Date.now();
 
+  try {
+    logger.info("Validando sesión de WhatsApp Web...");
+
+    await page.reload({
+      waitUntil: "domcontentloaded",
+      timeout: 60000
+    });
+
+    await page.waitForTimeout(2500);
+  } catch (e) {
+    logger.warn(
+      { err: e?.message || String(e) },
+      "Error validando sesión de WhatsApp"
+    );
+  }
+}
   try {
     const bodyText = await page.locator("body")
       .innerText()
